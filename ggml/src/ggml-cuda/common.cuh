@@ -1013,7 +1013,9 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_pool & pool(int device) {
         if (pools[device] == nullptr) {
+            GGML_LOG_INFO("[POOL] Creating pool for device %d\n", device);
             pools[device] = new_pool_for_device(device);
+            GGML_LOG_INFO("[POOL] Pool created for device %d\n", device);
         }
         return *pools[device];
     }

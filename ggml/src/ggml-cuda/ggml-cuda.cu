@@ -112,7 +112,28 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
     ggml_cuda_set_device(device);
     cudaError_t err;
     if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
+        static bool uvm_logged = false;
+        if (!uvm_logged) {
+            GGML_LOG_INFO("[UVM] Unified Memory ENABLED via cudaMallocManaged\n");
+            uvm_logged = true;
+        }
+        size_t size_mb = size / (1024 * 1024);
+        GGML_LOG_INFO("[UVM] Allocating %zu MB with cudaMallocManaged on device %d\n", size_mb, device);
         err = cudaMallocManaged(ptr, size);
+        if (err == cudaSuccess) {
+            GGML_LOG_INFO("[UVM] Successfully allocated %zu MB at %p\n", size_mb, *ptr);
+
+            // Set memory advise to prefer GPU access but allow CPU fallback
+            // This should enable true oversubscription by allowing paging to system RAM
+            cudaError_t advise_err = cudaMemAdvise(*ptr, size, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
+            if (advise_err == cudaSuccess) {
+                GGML_LOG_INFO("[UVM] Set preferred location to CPU for %zu MB (enables paging)\n", size_mb);
+            } else {
+                GGML_LOG_WARN("[UVM] Could not set preferred location: %s\n", cudaGetErrorString(advise_err));
+            }
+        } else {
+            GGML_LOG_ERROR("[UVM] FAILED to allocate %zu MB: %s\n", size_mb, cudaGetErrorString(err));
+        }
 #if defined(GGML_USE_HIP)
         if (err == hipSuccess) {
             CUDA_CHECK(cudaMemAdvise(*ptr, size, hipMemAdviseSetCoarseGrain, device));
@@ -130,6 +151,13 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
         }
 #endif // defined(GGML_USE_HIP)
     } else {
+        static bool regular_logged = false;
+        if (!regular_logged) {
+            GGML_LOG_INFO("[REGULAR] Unified Memory DISABLED, using cudaMalloc\n");
+            regular_logged = true;
+        }
+        GGML_LOG_DEBUG("[REGULAR] Allocating %zu MB with cudaMalloc on device %d\n",
+                       size / (1024 * 1024), device);
         err = cudaMalloc(ptr, size);
     }
     return err;
@@ -413,7 +441,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 // pool with virtual memory
 #if defined(GGML_USE_VMM)
 struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
-    static const size_t CUDA_POOL_VMM_MAX_SIZE = 1ull << 35; // 32 GB
+    static const size_t CUDA_POOL_VMM_MAX_SIZE = 1ull << 37; // 128 GB (increased from 32GB to support oversubscription)
 
     int device;
     CUdeviceptr pool_addr = 0;
@@ -522,11 +550,25 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 #endif // defined(GGML_USE_VMM)
 
 std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(int device) {
+    GGML_LOG_INFO("[POOL] new_pool_for_device called for device %d\n", device);
+
+    // If UVM is enabled via environment variable, use legacy pool (cudaMalloc/cudaMallocManaged)
+    // instead of VMM pool to avoid 128GB virtual address space limit
+    const char* uvm_env = getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY");
+    GGML_LOG_INFO("[POOL] GGML_CUDA_ENABLE_UNIFIED_MEMORY = %s\n", uvm_env ? uvm_env : "NULL");
+
+    if (uvm_env != nullptr) {
+        GGML_LOG_INFO("[UVM] Using legacy pool (bypassing VMM) for device %d\n", device);
+        return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_leg(device));
+    }
+
 #if defined(GGML_USE_VMM)
     if (ggml_cuda_info().devices[device].vmm) {
+        GGML_LOG_INFO("[VMM] Using VMM pool for device %d\n", device);
         return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_vmm(device));
     }
 #endif // defined(GGML_USE_VMM)
+    GGML_LOG_INFO("[LEGACY] Using legacy pool for device %d\n", device);
     return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_leg(device));
 }
 
