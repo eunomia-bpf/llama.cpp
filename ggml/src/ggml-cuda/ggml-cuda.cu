@@ -517,9 +517,9 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             // add to the pool
             pool_size += reserve_size;
 
-            //printf("cuda pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
-            //       device, (unsigned long long) (pool_size/1024/1024),
-            //       (unsigned long long) (reserve_size/1024/1024));
+            printf("cuda pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
+                  device, (unsigned long long) (pool_size/1024/1024),
+                  (unsigned long long) (reserve_size/1024/1024));
         }
 
         GGML_ASSERT(pool_addr != 0);
