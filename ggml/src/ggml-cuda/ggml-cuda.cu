@@ -2757,9 +2757,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
     if (first_run) {
         if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
             assert(lobal_uvm_allocation_pointer.ptr);
-            cudaMemAdvise(global_uvm_allocation_pointer.ptr, global_uvm_allocation_pointer.size, cudaMemAdviseUnsetPreferredLocation, ggml_cuda_get_device());
+            cudaMemAdvise(global_uvm_allocation_pointer.ptr, global_uvm_allocation_pointer.size, cudaMemAdviseUnsetPreferredLocation, cudaCpuDeviceId);
             // cudaMemAdvise(global_uvm_allocation_pointer.ptr, global_uvm_allocation_pointer.size, cudaMemAdviseSetAccessedBy, ggml_cuda_get_device());
             cudaMemAdvise(global_uvm_allocation_pointer.ptr, global_uvm_allocation_pointer.size, cudaMemAdviseSetPreferredLocation, ggml_cuda_get_device());
+            // cudaMemAdvise(global_uvm_allocation_pointer.ptr, global_uvm_allocation_pointer.size, cudaMemAdviseUnsetPreferredLocation, ggml_cuda_get_device());
             first_run = false;
             GGML_LOG_INFO("[UVM] unset the cudaMemAdvise(*ptr, size, cudaMemAdviseUnsetPreferredLocation, cudaCpuDeviceId);");
         }
