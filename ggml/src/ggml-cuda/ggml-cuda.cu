@@ -77,12 +77,11 @@
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
-// UVM Adaptive Strategy: Track allocations for warmup-then-unset
+// UVM Adaptive Strategy: Track first allocation for warmup-then-migrate
 struct uvm_allocation {
     void* ptr;
     size_t size;
 } global_uvm_allocation_pointer;
-
 
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
@@ -129,11 +128,13 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
         GGML_LOG_INFO("[UVM] Allocating %zu MB with cudaMallocManaged on device %d\n", size_mb, device);
         err = cudaMallocManaged(ptr, size);
         if (first_run) {
+            // Phase 1: Keep first (largest) allocation on CPU during model loading
+            // to prevent GPU memory exhaustion before compute begins
             cudaMemAdvise(*ptr, size, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
             first_run = false;
             global_uvm_allocation_pointer.ptr = *ptr;
             global_uvm_allocation_pointer.size = size;
-            GGML_LOG_INFO("[UVM] set the cudaMemAdvise(*ptr, size, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);");
+            GGML_LOG_INFO("[UVM] Set preferred location to CPU for first allocation (%zu MB)\n", size_mb);
         }
         if (err == cudaSuccess) {
             GGML_LOG_INFO("[UVM] Successfully allocated %zu MB at %p\n", size_mb, *ptr);
@@ -2774,15 +2775,22 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         GGML_LOG_ERROR("%s: %s failed\n", __func__, ggml_op_desc(dst));
         CUDA_CHECK(err);
     }
-    static bool first_run = true;
-    if (first_run) {
-        assert(global_uvm_allocation_pointer.ptr);
-        cudaMemAdvise(global_uvm_allocation_pointer.ptr, global_uvm_allocation_pointer.size, cudaMemAdviseUnsetPreferredLocation, ggml_cuda_get_device());
-        // cudaMemAdvise(global_uvm_allocation_pointer.ptr, global_uvm_allocation_pointer.size, cudaMemAdviseSetAccessedBy, ggml_cuda_get_device());
-        cudaMemAdvise(global_uvm_allocation_pointer.ptr, global_uvm_allocation_pointer.size, cudaMemAdviseSetPreferredLocation, ggml_cuda_get_device());
-        first_run = false;
-        GGML_LOG_INFO("[UVM] unset the cudaMemAdvise(*ptr, size, cudaMemAdviseUnsetPreferredLocation, cudaCpuDeviceId);");
+
+    // Phase 2 of UVM warmup-then-migrate: after first compute forward,
+    // switch the first allocation's preferred location from CPU to GPU.
+    // This lets the driver migrate hot pages to GPU for better perf.
+    // Guard: only run if UVM was enabled (global_uvm_allocation_pointer was set).
+    static bool uvm_first_compute = true;
+    if (uvm_first_compute && global_uvm_allocation_pointer.ptr) {
+        cudaMemAdvise(global_uvm_allocation_pointer.ptr, global_uvm_allocation_pointer.size,
+                      cudaMemAdviseUnsetPreferredLocation, ggml_cuda_get_device());
+        cudaMemAdvise(global_uvm_allocation_pointer.ptr, global_uvm_allocation_pointer.size,
+                      cudaMemAdviseSetPreferredLocation, ggml_cuda_get_device());
+        uvm_first_compute = false;
+        GGML_LOG_INFO("[UVM] Phase 2: switched preferred location to GPU for %zu MB\n",
+                      global_uvm_allocation_pointer.size / (1024 * 1024));
     }
+
     return true;
 }
 
