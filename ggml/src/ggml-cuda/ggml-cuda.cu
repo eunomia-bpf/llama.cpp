@@ -77,6 +77,13 @@
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
+// UVM Adaptive Strategy: Track allocations for warmup-then-unset
+struct uvm_allocation {
+    void* ptr;
+    size_t size;
+} global_uvm_allocation_pointer;
+
+
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
     int id = -1; // in case cudaGetDevice fails
@@ -113,6 +120,7 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
     cudaError_t err;
     if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
         static bool uvm_logged = false;
+        static bool first_run = true;
         if (!uvm_logged) {
             GGML_LOG_INFO("[UVM] Unified Memory ENABLED via cudaMallocManaged\n");
             uvm_logged = true;
@@ -120,17 +128,15 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
         size_t size_mb = size / (1024 * 1024);
         GGML_LOG_INFO("[UVM] Allocating %zu MB with cudaMallocManaged on device %d\n", size_mb, device);
         err = cudaMallocManaged(ptr, size);
+        if (first_run) {
+            cudaMemAdvise(*ptr, size, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
+            first_run = false;
+            global_uvm_allocation_pointer.ptr = *ptr;
+            global_uvm_allocation_pointer.size = size;
+            GGML_LOG_INFO("[UVM] set the cudaMemAdvise(*ptr, size, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);");
+        }
         if (err == cudaSuccess) {
             GGML_LOG_INFO("[UVM] Successfully allocated %zu MB at %p\n", size_mb, *ptr);
-
-            // Set memory advise to prefer GPU access but allow CPU fallback
-            // This should enable true oversubscription by allowing paging to system RAM
-            cudaError_t advise_err = cudaMemAdvise(*ptr, size, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
-            if (advise_err == cudaSuccess) {
-                GGML_LOG_INFO("[UVM] Set preferred location to CPU for %zu MB (enables paging)\n", size_mb);
-            } else {
-                GGML_LOG_WARN("[UVM] Could not set preferred location: %s\n", cudaGetErrorString(advise_err));
-            }
         } else {
             GGML_LOG_ERROR("[UVM] FAILED to allocate %zu MB: %s\n", size_mb, cudaGetErrorString(err));
         }
@@ -2768,7 +2774,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         GGML_LOG_ERROR("%s: %s failed\n", __func__, ggml_op_desc(dst));
         CUDA_CHECK(err);
     }
-
+    static bool first_run = true;
+    if (first_run) {
+        assert(global_uvm_allocation_pointer.ptr);
+        cudaMemAdvise(global_uvm_allocation_pointer.ptr, global_uvm_allocation_pointer.size, cudaMemAdviseUnsetPreferredLocation, ggml_cuda_get_device());
+        // cudaMemAdvise(global_uvm_allocation_pointer.ptr, global_uvm_allocation_pointer.size, cudaMemAdviseSetAccessedBy, ggml_cuda_get_device());
+        cudaMemAdvise(global_uvm_allocation_pointer.ptr, global_uvm_allocation_pointer.size, cudaMemAdviseSetPreferredLocation, ggml_cuda_get_device());
+        first_run = false;
+        GGML_LOG_INFO("[UVM] unset the cudaMemAdvise(*ptr, size, cudaMemAdviseUnsetPreferredLocation, cudaCpuDeviceId);");
+    }
     return true;
 }
 
