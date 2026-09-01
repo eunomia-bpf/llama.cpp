@@ -27,6 +27,86 @@
 #include <sys/sysctl.h>
 #endif
 
+#if defined(__GNUC__) && !defined(_WIN32)
+#define GPUBPF_EXPERT_MARKER __attribute__((noinline, used, visibility("default")))
+#else
+#define GPUBPF_EXPERT_MARKER
+#endif
+
+extern "C" {
+GPUBPF_EXPERT_MARKER void gpubpf_expert_tensor_layout(
+        const char * name,
+        const void * base,
+        uint64_t total_bytes,
+        uint64_t per_expert_bytes,
+        uint32_t n_experts,
+        uint32_t is_bias);
+GPUBPF_EXPERT_MARKER void gpubpf_expert_route(
+        const void * tensor_base,
+        uint32_t expert_id);
+}
+
+// Stable, observation-only uprobe targets for the gpubpf Expert Buffering
+// experiment. The volatile compiler barrier keeps the argument registers
+// observable without changing tensor allocation, routing, or copies.
+extern "C" void gpubpf_expert_tensor_layout(
+        const char * name,
+        const void * base,
+        uint64_t total_bytes,
+        uint64_t per_expert_bytes,
+        uint32_t n_experts,
+        uint32_t is_bias) {
+#if defined(__GNUC__) && !defined(_WIN32)
+    __asm__ __volatile__("" : : "r"(name), "r"(base), "r"(total_bytes),
+                         "r"(per_expert_bytes), "r"(n_experts), "r"(is_bias)
+                       : "memory");
+#else
+    (void) name;
+    (void) base;
+    (void) total_bytes;
+    (void) per_expert_bytes;
+    (void) n_experts;
+    (void) is_bias;
+#endif
+}
+
+extern "C" void gpubpf_expert_route(
+        const void * tensor_base,
+        uint32_t expert_id) {
+#if defined(__GNUC__) && !defined(_WIN32)
+    __asm__ __volatile__("" : : "r"(tensor_base), "r"(expert_id) : "memory");
+#else
+    (void) tensor_base;
+    (void) expert_id;
+#endif
+}
+
+static void gpubpf_maybe_mark_expert_tensor(const struct ggml_tensor * tensor) {
+    static const bool enabled = getenv("GPUBPF_EXPERT_LAYOUT_TRACE") != NULL;
+    if (!enabled || !tensor || !tensor->data) {
+        return;
+    }
+
+    const char * name = tensor->name;
+    if (!strstr(name, ".ffn_") || !strstr(name, "_exps.")) {
+        return;
+    }
+
+    const char * suffix = strrchr(name, '.');
+    const bool is_bias = suffix && strcmp(suffix, ".bias") == 0;
+    const int expert_axis = is_bias ? 1 : 2;
+    if (tensor->ne[expert_axis] <= 1 || tensor->ne[expert_axis] > UINT32_MAX) {
+        return;
+    }
+
+    gpubpf_expert_tensor_layout(name,
+                                tensor->data,
+                                ggml_nbytes(tensor),
+                                tensor->nb[expert_axis],
+                                (uint32_t) tensor->ne[expert_axis],
+                                is_bias ? 1U : 0U);
+}
+
 
 // backend buffer type
 
@@ -1495,6 +1575,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prev_ids_tensor = ids_tensor;
                     }
 
+                    static const bool trace_expert_routes = getenv("GPUBPF_EXPERT_ROUTE_TRACE") != NULL;
+                    if (trace_expert_routes) {
+                        for (int32_t expert_id = 0; expert_id < n_expert; ++expert_id) {
+                            if (ggml_bitset_get(used_ids.data(), expert_id)) {
+                                gpubpf_expert_route(input->data, (uint32_t) expert_id);
+                            }
+                        }
+                    }
+
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                         const size_t expert_offset = first_id * expert_size;
@@ -1850,7 +1939,11 @@ enum ggml_status ggml_backend_tensor_alloc(ggml_backend_buffer_t buffer, struct 
 
     tensor->buffer = buffer;
     tensor->data = addr;
-    return ggml_backend_buffer_init_tensor(buffer, tensor);
+    const enum ggml_status status = ggml_backend_buffer_init_tensor(buffer, tensor);
+    if (status == GGML_STATUS_SUCCESS) {
+        gpubpf_maybe_mark_expert_tensor(tensor);
+    }
+    return status;
 }
 
 static struct ggml_tensor * graph_copy_dup_tensor(struct ggml_hash_set hash_set, struct ggml_tensor ** node_copies,
