@@ -38,6 +38,10 @@
 #include <syscall.h>
 #endif
 
+// Observation-only marker defined by ggml-base. The CPU MUL_MAT_ID path is
+// used when an expert operation is not selected for device offload.
+extern void gpubpf_expert_route(const void * tensor_base, uint32_t expert_id);
+
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
 #endif
@@ -1570,6 +1574,11 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     if (ith == 0) {
+        const bool trace_expert_routes =
+            getenv("GPUBPF_EXPERT_ROUTE_TRACE") != NULL &&
+            strstr(src0->name, ".ffn_") != NULL &&
+            strstr(src0->name, "_exps.") != NULL;
+
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
@@ -1579,6 +1588,10 @@ static void ggml_compute_forward_mul_mat_id(
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
                 assert(i02 >= 0 && i02 < n_as);
+
+                if (trace_expert_routes && matrix_row_counts[i02] == 0) {
+                    gpubpf_expert_route(src0->data, (uint32_t) i02);
+                }
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
