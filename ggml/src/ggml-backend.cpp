@@ -88,7 +88,8 @@ static void gpubpf_maybe_mark_expert_tensor(const struct ggml_tensor * tensor) {
     }
 
     const char * name = tensor->name;
-    if (!strstr(name, ".ffn_") || !strstr(name, "_exps.")) {
+    if (strncmp(name, "blk.", 4) != 0 ||
+        !strstr(name, ".ffn_") || !strstr(name, "_exps.")) {
         return;
     }
 
